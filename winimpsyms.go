@@ -23,6 +23,9 @@ var allsymsflag = flag.Bool("all", false, "Process all syms, not just import sym
 var watchsymsflag = flag.String("watch", "", "Comma-separated list of additional symbols to include in analysis")
 var watched map[string]bool
 
+// [ 0](sec  1)(fl 0x00)(ty   0)(scl   3) (nx 1) 0x00000000 .text
+var symre = regexp.MustCompile(`^\[\s*\d+\]\(sec\s+(\-?\d+)\)\(fl\s+\S+\)\(ty\s+\S+\)\(scl\s+\d+\)\s*\(nx\s+\S+\)\s+(\S+)\s+(\S+)\s*$`)
+
 type definfo struct {
 	objidx int
 	secidx int
@@ -34,8 +37,8 @@ type reflist []refinfo
 type refinfo struct {
 	objidx  int
 	secidx  int
-	relflav string
 	offsets []int
+	def     bool
 }
 
 type secinfo struct {
@@ -57,6 +60,8 @@ type state struct {
 	defs map[string]definfo
 	// Maps import symbol to list of ref infos.
 	refs map[string]reflist
+	// list of all interesting symbols, generated in pass 1.
+	all map[string]bool
 	// scanner
 	scanner *bufio.Scanner
 	// current obj idx
@@ -69,6 +74,7 @@ func newState(objs []string) *state {
 		secmap: make(map[string]int),
 		defs:   make(map[string]definfo),
 		refs:   make(map[string]reflist),
+		all:    make(map[string]bool),
 	}
 }
 
@@ -118,7 +124,11 @@ func (s *state) String() string {
 			rl := s.refs[v]
 			fmt.Fprintf(sb, " %q:\n", v)
 			for j, ri := range rl {
-				fmt.Fprintf(sb, "   %d: O=%d S=%d %s\n",
+				def := " "
+				if ri.def {
+					def = "*"
+				}
+				fmt.Fprintf(sb, "  %s%d: O=%d S=%d %s\n", def,
 					j, ri.objidx, ri.secidx, hexlist(ri.offsets))
 			}
 		}
@@ -126,7 +136,59 @@ func (s *state) String() string {
 	return sb.String()
 }
 
-func (s *state) read(infile string) error {
+// pass1 looks just at the symbol table for the specified object. Here
+// the idea is to build up a list of all import symbols.
+func (s *state) pass1(infile string) error {
+	// kick off command
+	cmd := exec.Command("llvm-objdump-14", "-t", infile)
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("running llvm-objdump-14 on %s: %v", infile, err)
+	}
+
+	// process the output
+	s.scanner = bufio.NewScanner(strings.NewReader(string(out)))
+	for s.scanner.Scan() {
+		line := s.scanner.Text()
+		if line == "SYMBOL TABLE:" {
+			for s.scanner.Scan() {
+				line := s.scanner.Text()
+				if strings.HasPrefix(line, "AUX ") {
+					continue
+				}
+				if line == "" {
+					break
+				}
+				m := symre.FindStringSubmatch(line)
+				if len(m) == 0 {
+					return fmt.Errorf("bad line %s in symtab", line)
+				}
+				sname := m[3]
+				if !s.isInterestingSym(sname) {
+					continue
+				}
+				s.all[sname] = true
+			}
+		}
+	}
+	return nil
+}
+
+// Expand out set of interesting symbols from __imp_X to include X as well.
+func (s *state) pass2() {
+	keys := make([]string, 0, len(s.all))
+	for k := range s.all {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		if strings.HasPrefix(k, "__imp_") {
+			x := k[len("__imp_"):]
+			s.all[x] = true
+		}
+	}
+}
+
+func (s *state) pass3(infile string) error {
 	// kick off command
 	cmd := exec.Command("llvm-objdump-14",
 		"-h", // section headers
@@ -194,9 +256,9 @@ func (s *state) digest(content string) error {
 	return nil
 }
 
-func isInterestingSym(sname string) bool {
+func (s *state) isInterestingSym(sname string) bool {
 	return strings.HasPrefix(sname, "__imp") ||
-		*allsymsflag || watched[sname]
+		*allsymsflag || watched[sname] || s.all[sname]
 }
 
 func (s *state) readSymtab() error {
@@ -223,9 +285,10 @@ func (s *state) readSymtab() error {
 			return fmt.Errorf("can't parse value in line %s in symtab", line)
 		}
 		sname := m[3]
-		if !isInterestingSym(sname) {
+		if !s.isInterestingSym(sname) {
 			continue
 		}
+		def := false
 		if secidx != 0 {
 			// This is a definition.
 			di := definfo{
@@ -237,17 +300,18 @@ func (s *state) readSymtab() error {
 				panic("resolve collision here")
 			}
 			s.defs[sname] = di
-		} else {
-			// this is a reference. Can't fill in secidx
-			// until we look at relocations.
-			ri := refinfo{
-				objidx: s.objidx,
-				secidx: secidx,
-			}
-			sl := s.refs[sname]
-			sl = append(sl, ri)
-			s.refs[sname] = sl
+			def = true
 		}
+		// now add reference. Can't fill in secidx until we look
+		// at relocations.
+		ri := refinfo{
+			objidx: s.objidx,
+			secidx: secidx,
+			def:    def,
+		}
+		sl := s.refs[sname]
+		sl = append(sl, ri)
+		s.refs[sname] = sl
 	}
 	return nil
 }
@@ -275,7 +339,7 @@ func (s *state) readRelocations(rline string) error {
 		soff := m[1]
 		//styp := m[2]
 		sval := m[3]
-		if !isInterestingSym(sval) {
+		if !s.isInterestingSym(sval) {
 			continue
 		}
 		var off int
@@ -370,7 +434,14 @@ func main() {
 	s := newState(infiles)
 	for k, ifile := range infiles {
 		s.objidx = k
-		if err := s.read(ifile); err != nil {
+		if err := s.pass1(ifile); err != nil {
+			fatal("reading %s: %v", ifile, err)
+		}
+	}
+	s.pass2()
+	for k, ifile := range infiles {
+		s.objidx = k
+		if err := s.pass3(ifile); err != nil {
 			fatal("reading %s: %v", ifile, err)
 		}
 	}

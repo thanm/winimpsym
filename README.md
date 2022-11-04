@@ -3,9 +3,13 @@
 
 This tool helps debug problems in the Go linker relating to handling
 of import ("__imp_XXX"), which require some tricky handling in the 
-linker's host object loader.
+linker's host object loader. 
 
-Run the tool on a collection of objects:
+The tool will scan the specified list of objects, looking for import symbols,
+then for each import symbol __imp_X and its target symbol X, it will report
+information on definitions (if we have a definition) and on references.
+
+Example:
 
 ```
 $ go build .
