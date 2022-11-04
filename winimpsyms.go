@@ -15,6 +15,13 @@ import (
 	"strings"
 )
 
+// TODO:
+// - print ref/def summary, e.g.
+//   ref(__imp_): foo, bar
+//   def(__imp_) ref(__imp_): baz
+//   ref(__imp_X) ref(X): _errno
+//   ref(__imp_X) def(X): ?
+
 // Overview: given a set of object files, look for definitions and references
 // to import symbols.
 
@@ -25,6 +32,33 @@ var watched map[string]bool
 
 // [ 0](sec  1)(fl 0x00)(ty   0)(scl   3) (nx 1) 0x00000000 .text
 var symre = regexp.MustCompile(`^\[\s*\d+\]\(sec\s+(\-?\d+)\)\(fl\s+\S+\)\(ty\s+\S+\)\(scl\s+\d+\)\s*\(nx\s+\S+\)\s+(\S+)\s+(\S+)\s*$`)
+
+type defrefmask uint32
+
+const (
+	defrefnone defrefmask = 0
+	defbase    defrefmask = 1 << iota // base symbol X is defined
+	refbase                           // base symbol X is referenced
+	defimp                            // import symbol __imp_X is defined
+	refimp                            // import symbol __imp_X is referenced
+)
+
+func (drm defrefmask) String() string {
+	res := ""
+	if drm&defbase != 0 {
+		res += " defbase"
+	}
+	if drm&refbase != 0 {
+		res += " refbase"
+	}
+	if drm&defimp != 0 {
+		res += " defimp"
+	}
+	if drm&refimp != 0 {
+		res += " refimp"
+	}
+	return res
+}
 
 type definfo struct {
 	objidx int
@@ -62,6 +96,8 @@ type state struct {
 	refs map[string]reflist
 	// list of all interesting symbols, generated in pass 1.
 	all map[string]bool
+	// def/ref disposition for symbol X
+	defref map[string]defrefmask
 	// scanner
 	scanner *bufio.Scanner
 	// current obj idx
@@ -75,6 +111,7 @@ func newState(objs []string) *state {
 		defs:   make(map[string]definfo),
 		refs:   make(map[string]reflist),
 		all:    make(map[string]bool),
+		defref: make(map[string]defrefmask),
 	}
 }
 
@@ -132,6 +169,15 @@ func (s *state) String() string {
 					j, ri.objidx, ri.secidx, hexlist(ri.offsets))
 			}
 		}
+	}
+	dr := make([]string, 0, len(s.defref))
+	for k := range s.defref {
+		dr = append(dr, k)
+	}
+	sort.Strings(dr)
+	fmt.Fprintf(sb, "Def/ref breakdown:\n")
+	for _, v := range dr {
+		fmt.Fprintf(sb, " %q: %s\n", v, s.defref[v])
 	}
 	return sb.String()
 }
@@ -301,6 +347,7 @@ func (s *state) readSymtab() error {
 			}
 			s.defs[sname] = di
 			def = true
+			s.maskAddDef(sname)
 		}
 		// now add reference. Can't fill in secidx until we look
 		// at relocations.
@@ -312,8 +359,29 @@ func (s *state) readSymtab() error {
 		sl := s.refs[sname]
 		sl = append(sl, ri)
 		s.refs[sname] = sl
+		if !def {
+			s.maskAddRef(sname)
+		}
 	}
 	return nil
+}
+
+func (s *state) maskAddDef(sname string) {
+	if strings.HasPrefix(sname, "__imp_") {
+		x := sname[len("__imp_"):]
+		s.defref[x] = s.defref[x] | defimp
+	} else {
+		s.defref[sname] = s.defref[sname] | defbase
+	}
+}
+
+func (s *state) maskAddRef(sname string) {
+	if strings.HasPrefix(sname, "__imp_") {
+		x := sname[len("__imp_"):]
+		s.defref[x] = s.defref[x] | refimp
+	} else {
+		s.defref[sname] = s.defref[sname] | refbase
+	}
 }
 
 func (s *state) readRelocations(rline string) error {
