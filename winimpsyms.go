@@ -41,6 +41,7 @@ const (
 	refbase                           // base symbol X is referenced
 	defimp                            // import symbol __imp_X is defined
 	refimp                            // import symbol __imp_X is referenced
+	dsameobj                          // defimp and defbase in same obj
 )
 
 func (drm defrefmask) String() string {
@@ -56,6 +57,9 @@ func (drm defrefmask) String() string {
 	}
 	if drm&refimp != 0 {
 		res += " refimp"
+	}
+	if drm&dsameobj != 0 {
+		res += " sameobj"
 	}
 	return res
 }
@@ -308,6 +312,7 @@ func (s *state) isInterestingSym(sname string) bool {
 }
 
 func (s *state) readSymtab() error {
+	defs := make(map[string]struct{})
 	// [ 0](sec  1)(fl 0x00)(ty   0)(scl   3) (nx 1) 0x00000000 .text
 	symre := regexp.MustCompile(`^\[\s*\d+\]\(sec\s+(\-?\d+)\)\(fl\s+\S+\)\(ty\s+\S+\)\(scl\s+\d+\)\s*\(nx\s+\S+\)\s+(\S+)\s+(\S+)\s*$`)
 	for s.scanner.Scan() {
@@ -316,7 +321,7 @@ func (s *state) readSymtab() error {
 			continue
 		}
 		if line == "" {
-			return nil
+			break
 		}
 		m := symre.FindStringSubmatch(line)
 		if len(m) == 0 {
@@ -348,6 +353,7 @@ func (s *state) readSymtab() error {
 			s.defs[sname] = di
 			def = true
 			s.maskAddDef(sname)
+			defs[sname] = struct{}{}
 		}
 		// now add reference. Can't fill in secidx until we look
 		// at relocations.
@@ -361,6 +367,14 @@ func (s *state) readSymtab() error {
 		s.refs[sname] = sl
 		if !def {
 			s.maskAddRef(sname)
+		}
+	}
+	for k := range defs {
+		if strings.HasPrefix(k, "__imp_") {
+			base := k[len("__imp_"):]
+			if _, ok := defs[base]; ok {
+				s.defref[base] = s.defref[base] | dsameobj
+			}
 		}
 	}
 	return nil
