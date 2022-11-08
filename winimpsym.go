@@ -16,11 +16,7 @@ import (
 )
 
 // TODO:
-// - print ref/def summary, e.g.
-//   ref(__imp_): foo, bar
-//   def(__imp_) ref(__imp_): baz
-//   ref(__imp_X) ref(X): _errno
-//   ref(__imp_X) def(X): ?
+// - write an objdump -tldr dumper that puts out excerpts of the disassembly
 
 // Overview: given a set of object files, look for definitions and references
 // to import symbols.
@@ -28,10 +24,13 @@ import (
 var inputsflag = flag.String("i", "", "Comma-separated list of input files (omit to read from stdin)")
 var allsymsflag = flag.Bool("all", false, "Process all syms, not just import syms")
 var watchsymsflag = flag.String("watch", "", "Comma-separated list of additional symbols to include in analysis")
+
 var watched map[string]bool
 
 // [ 0](sec  1)(fl 0x00)(ty   0)(scl   3) (nx 1) 0x00000000 .text
 var symre = regexp.MustCompile(`^\[\s*\d+\]\(sec\s+(\-?\d+)\)\(fl\s+\S+\)\(ty\s+\S+\)\(scl\s+\d+\)\s*\(nx\s+\S+\)\s+(\S+)\s+(\S+)\s*$`)
+
+const imppref = "__imp_"
 
 type defrefmask uint32
 
@@ -154,6 +153,18 @@ func (s *state) String() string {
 		sb.WriteString("]")
 		return sb.String()
 	}
+	dumpref := func(sname string) {
+		fmt.Fprintf(sb, " %q:\n", sname)
+		rl := s.refs[sname]
+		for j, ri := range rl {
+			def := " "
+			if ri.def {
+				def = "*"
+			}
+			fmt.Fprintf(sb, "  %s%d: O=%d S=%d %s\n", def,
+				j, ri.objidx, ri.secidx, hexlist(ri.offsets))
+		}
+	}
 	if len(s.refs) != 0 {
 		refs := make([]string, 0, len(s.refs))
 		for k := range s.refs {
@@ -162,15 +173,14 @@ func (s *state) String() string {
 		sort.Strings(refs)
 		fmt.Fprintf(sb, "Refs:\n")
 		for _, v := range refs {
-			rl := s.refs[v]
-			fmt.Fprintf(sb, " %q:\n", v)
-			for j, ri := range rl {
-				def := " "
-				if ri.def {
-					def = "*"
-				}
-				fmt.Fprintf(sb, "  %s%d: O=%d S=%d %s\n", def,
-					j, ri.objidx, ri.secidx, hexlist(ri.offsets))
+			// Dump symbol first followed by import symbol.
+			if strings.HasPrefix(v, imppref) {
+				continue
+			}
+			dumpref(v)
+			iv := imppref + v
+			if _, ok := s.refs[iv]; ok {
+				dumpref(iv)
 			}
 		}
 	}
@@ -231,8 +241,8 @@ func (s *state) pass2() {
 		keys = append(keys, k)
 	}
 	for _, k := range keys {
-		if strings.HasPrefix(k, "__imp_") {
-			x := k[len("__imp_"):]
+		if strings.HasPrefix(k, imppref) {
+			x := k[len(imppref):]
 			s.all[x] = true
 		}
 	}
@@ -370,8 +380,8 @@ func (s *state) readSymtab() error {
 		}
 	}
 	for k := range defs {
-		if strings.HasPrefix(k, "__imp_") {
-			base := k[len("__imp_"):]
+		if strings.HasPrefix(k, imppref) {
+			base := k[len(imppref):]
 			if _, ok := defs[base]; ok {
 				s.defref[base] = s.defref[base] | dsameobj
 			}
@@ -381,8 +391,8 @@ func (s *state) readSymtab() error {
 }
 
 func (s *state) maskAddDef(sname string) {
-	if strings.HasPrefix(sname, "__imp_") {
-		x := sname[len("__imp_"):]
+	if strings.HasPrefix(sname, imppref) {
+		x := sname[len(imppref):]
 		s.defref[x] = s.defref[x] | defimp
 	} else {
 		s.defref[sname] = s.defref[sname] | defbase
@@ -390,8 +400,8 @@ func (s *state) maskAddDef(sname string) {
 }
 
 func (s *state) maskAddRef(sname string) {
-	if strings.HasPrefix(sname, "__imp_") {
-		x := sname[len("__imp_"):]
+	if strings.HasPrefix(sname, imppref) {
+		x := sname[len(imppref):]
 		s.defref[x] = s.defref[x] | refimp
 	} else {
 		s.defref[sname] = s.defref[sname] | refbase
@@ -486,6 +496,137 @@ func (s *state) readSections() error {
 	return nil
 }
 
+type objinfo struct {
+	objidx int
+	oname  string
+}
+
+func (s *state) collectWatchedFiles() []objinfo {
+	oinds := make(map[int]bool)
+	for k := range watched {
+		rl := s.refs[k]
+		for _, ri := range rl {
+			oinds[ri.objidx] = true
+		}
+	}
+	res := make([]objinfo, 0, len(oinds))
+	for oidx := range oinds {
+		res = append(res, objinfo{objidx: oidx, oname: s.objs[oidx]})
+	}
+	sort.Slice(res, func(i, j int) bool {
+		if res[i].oname != res[j].oname {
+			return res[i].oname < res[j].oname
+		}
+		return res[i].objidx < res[j].objidx
+	})
+	return res
+}
+
+func (s *state) dumpWatched() error {
+
+	// Figure out which files we're ging to e
+	ofiles := s.collectWatchedFiles()
+
+	// Dump excerpts from each file.
+	for _, of := range ofiles {
+		ofile := of.oname
+		cmd := exec.Command("llvm-objdump-14",
+			"-l", // line numbers
+			"-d", // assembly
+			"-r", // relocations
+			ofile)
+		out, err := cmd.Output()
+		if err != nil {
+			return fmt.Errorf("running llvm-objdump-14 on %s: %v", ofile, err)
+		}
+		fmt.Printf("\nexcerpts from 'llvm-objdump-14 -ldr %s`\n", ofile)
+		if err := s.emitExcerpts(string(out), of.objidx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *state) emitExcerpts(content string, oidx int) error {
+	// 0000000000000000 <makeEvent>:
+	var fnstre = regexp.MustCompile(`^\S+\s+\<(\S+)\>\:\s*$`)
+	// 000000000000009b:  IMAGE_REL_AMD64_REL32	printf
+	var relocre = regexp.MustCompile(`^\s+(\S+)\:\s+IMAGE_\S+\s+(\S+)\s*$`)
+
+	fnLine := 0
+	lines := strings.Split(content, "\n")
+	painted := make(map[int]bool)
+	oimap := make(map[int]int)
+	ofmap := make(map[int]int)
+	fnmap := make(map[int]int)
+	for i := range lines {
+		line := lines[i]
+		m := fnstre.FindStringSubmatch(line)
+		if len(m) != 0 {
+			fnLine = i
+			continue
+		}
+		m = relocre.FindStringSubmatch(line)
+		if len(m) == 0 {
+			continue
+		}
+		off := m[1]
+		fn := m[2]
+		if !watched[fn] {
+			continue
+		}
+		var offset int
+		if n, err := fmt.Sscanf(off, "%x", &offset); n != 1 || err != nil {
+			return fmt.Errorf("bad offset %s", off)
+		}
+		ri, rerr := s.findRefInfo(fn, offset, oidx)
+		if rerr != nil {
+			return rerr
+		}
+		oimap[i] = ri.objidx
+		ofmap[i] = offset
+		fnmap[i] = fnLine
+		painted[i] = true
+	}
+	for i := range lines {
+		if !painted[i] {
+			continue
+		}
+		oi := oimap[i]
+		of := ofmap[i]
+		fn := fnmap[i]
+		fmt.Printf("\n=-= ref O%d off=0x%x:\n", oi, of)
+		// func
+		fmt.Printf("%d: %s\n...\n", fn, lines[fn])
+		// reloc, couple of lines before and after
+		for ci := i - 2; ci <= i+2; ci++ {
+			if ci > 0 && ci < len(lines) {
+				fmt.Printf("%d: %s\n", ci, lines[ci])
+			}
+		}
+	}
+	return nil
+}
+
+func (s *state) findRefInfo(fn string, offset, oidx int) (*refinfo, error) {
+	rl := s.refs[fn]
+	for k := range rl {
+		ri := &rl[k]
+		if ri.objidx != oidx {
+			continue
+		}
+		for _, of := range ri.offsets {
+			if of == offset {
+				// Found.
+				return ri, nil
+			}
+		}
+		return nil, fmt.Errorf("could not find offset %x in refinfo for fn=%s",
+			offset, fn)
+	}
+	return nil, fmt.Errorf("could not find refinfo for fn=%s of=%x", fn, offset)
+}
+
 func usage(msg string) {
 	if len(msg) > 0 {
 		fmt.Fprintf(os.Stderr, "error: %s\n", msg)
@@ -510,6 +651,7 @@ func main() {
 	if *watchsymsflag != "" {
 		for _, s := range strings.Split(*watchsymsflag, ",") {
 			watched[s] = true
+			watched[imppref+s] = true
 		}
 	}
 	infiles := strings.Split(*inputsflag, ",")
@@ -527,5 +669,10 @@ func main() {
 			fatal("reading %s: %v", ifile, err)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "state: %s\n", s.String())
+	fmt.Fprintf(os.Stdout, "state: %s\n", s.String())
+	if len(watched) != 0 {
+		if err := s.dumpWatched(); err != nil {
+			fatal("dumping watched syms: %v", err)
+		}
+	}
 }
