@@ -264,14 +264,15 @@ func (s *state) pass3(infile string) error {
 		return fmt.Errorf("running llvm-objdump-14 on %s: %v", infile, err)
 	}
 
+	// try to derive path info
+	pi := s.pathinfo(infile)
+	s.paths = append(s.paths, pi)
+
 	// digest output
 	if err := s.digest(string(out)); err != nil {
 		return err
 	}
 
-	// try to derive path info
-	pi := s.pathinfo(infile)
-	s.paths = append(s.paths, pi)
 	return nil
 }
 
@@ -357,8 +358,8 @@ func (s *state) readSymtab() error {
 				secidx: secidx,
 				value:  value,
 			}
-			if _, ok := s.defs[sname]; ok {
-				panic("resolve collision here")
+			if v, ok := s.defs[sname]; ok {
+				return fmt.Errorf("internal error: collision on %q reading objidx %d, found previous def %+v", sname, s.objidx, v)
 			}
 			s.defs[sname] = di
 			def = true
@@ -666,7 +667,7 @@ func main() {
 	for k, ifile := range infiles {
 		s.objidx = k
 		if err := s.pass3(ifile); err != nil {
-			fatal("reading %s: %v", ifile, err)
+			fatal("reading %s: %v\nstate: %s\n", ifile, err, s.String())
 		}
 	}
 	fmt.Fprintf(os.Stdout, "state: %s\n", s.String())
