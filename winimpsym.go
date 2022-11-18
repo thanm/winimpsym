@@ -15,13 +15,13 @@ import (
 	"strings"
 )
 
-// TODO:
-// - write an objdump -tldr dumper that puts out excerpts of the disassembly
-
 // Overview: given a set of object files, look for definitions and references
 // to import symbols.
 
+const DefaultDumper = "llvm-objdump-14"
+
 var inputsflag = flag.String("i", "", "Comma-separated list of input files (omit to read from stdin)")
+var objdumpflag = flag.String("objdump", DefaultDumper, "Name of objdump program to invoke")
 var allsymsflag = flag.Bool("all", false, "Process all syms, not just import syms")
 var watchsymsflag = flag.String("watch", "", "Comma-separated list of additional symbols to include in analysis")
 
@@ -200,7 +200,7 @@ func (s *state) String() string {
 // the idea is to build up a list of all import symbols.
 func (s *state) pass1(infile string) error {
 	// kick off command
-	cmd := exec.Command("llvm-objdump-14", "-t", infile)
+	cmd := exec.Command(*objdumpflag, "-t", infile)
 	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("running llvm-objdump-14 on %s: %v", infile, err)
@@ -250,7 +250,7 @@ func (s *state) pass2() {
 
 func (s *state) pass3(infile string) error {
 	// kick off command
-	cmd := exec.Command("llvm-objdump-14",
+	cmd := exec.Command(*objdumpflag,
 		"-h", // section headers
 		"-t", // symbols
 		"-r", // relocations
@@ -531,7 +531,7 @@ func (s *state) dumpWatched() error {
 	// Dump excerpts from each file.
 	for _, of := range ofiles {
 		ofile := of.oname
-		cmd := exec.Command("llvm-objdump-14",
+		cmd := exec.Command(*objdumpflag,
 			"-l", // line numbers
 			"-d", // assembly
 			"-r", // relocations
